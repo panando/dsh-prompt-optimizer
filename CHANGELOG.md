@@ -2,6 +2,19 @@
 
 Notable changes to this project are documented here.
 
+## [1.0.2] - 2026-10-05
+
+### Fixed
+
+- **Peer range silently excluded published harness prereleases.** The range
+  `>=0.2.0-rc.1 <0.3.0` has no comparator on a prerelease version's exact
+  `major.minor.patch` tuple, so node-semver dropped every build outside the
+  `0.2.0` line — including the published `0.1.7-rc.2` and the current `alpha`
+  `0.2.1-alpha.1`. Users on those builds hit `ERESOLVE` on install. All four
+  `@deepseek-ai/*` peer entries now enumerate every published harness build
+  (the same convention `@panando/dsh-pua` uses), and a test asserts the range
+  keeps covering them.
+
 ## [1.0.1] - 2026-10-05
 
 ### Fixed

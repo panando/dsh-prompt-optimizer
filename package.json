@@ -1,6 +1,6 @@
 {
   "name": "@panando/dsh-prompt-optimizer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "One button prompt optimizer with configurable strategy.",
   "type": "commonjs",
   "main": "lib/index.cjs",
@@ -40,10 +40,10 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-rc.1 <0.3.0",
-    "@deepseek-ai/dsh-client-runtime": ">=0.2.0-rc.1 <0.3.0",
-    "@deepseek-ai/dsh-client-ui-conversation": ">=0.2.0-rc.1 <0.3.0",
-    "@deepseek-ai/dsh-client-ui-settings-general": ">=0.2.0-rc.1 <0.3.0"
+    "@deepseek-ai/dsh": "0.1.5-alpha.1 || 0.1.5-alpha.2 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.6-alpha.1 || 0.1.6-alpha.2 || 0.1.7-alpha.1 || 0.1.7-alpha.2 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-runtime": "0.1.5-alpha.1 || 0.1.5-alpha.2 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.6-alpha.1 || 0.1.6-alpha.2 || 0.1.7-alpha.1 || 0.1.7-alpha.2 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.5-alpha.1 || 0.1.5-alpha.2 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.6-alpha.1 || 0.1.6-alpha.2 || 0.1.7-alpha.1 || 0.1.7-alpha.2 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1",
+    "@deepseek-ai/dsh-client-ui-settings-general": "0.1.5-alpha.1 || 0.1.5-alpha.2 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.6-alpha.1 || 0.1.6-alpha.2 || 0.1.7-alpha.1 || 0.1.7-alpha.2 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {
@@ -81,5 +81,8 @@
   "engines": {
     "node": ">=22.19"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "semver": "^7.6.3"
+  }
 }
