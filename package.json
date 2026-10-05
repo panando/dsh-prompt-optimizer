@@ -1,6 +1,6 @@
 {
   "name": "@panando/dsh-prompt-optimizer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "One button prompt optimizer with configurable strategy.",
   "type": "commonjs",
   "main": "lib/index.cjs",

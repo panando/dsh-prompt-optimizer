@@ -31,9 +31,16 @@ test('generated host and client artifacts are loadable and self-contained', () =
   const host = require('../lib/index.cjs')
   assert.equal(host.name, 'dsh-prompt-optimizer')
   assert.equal(typeof host.apply, 'function')
+  const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
   const client = readFileSync(join(root, 'lib', 'client.cjs'), 'utf8')
   assert.match(client, /window\.__ModuleLoader__\.load/)
-  assert.match(client, /id: "dsh-prompt-optimizer"/)
+  // The client bundle must self-register under the exact package name; DSH keys
+  // its client-module manifest by package specifier and fails web boot when a
+  // scoped package declares a different (short) id.
+  assert.ok(
+    client.includes(`id: ${JSON.stringify(manifest.name)}`),
+    `client bundle id must equal package name "${manifest.name}"`,
+  )
   assert.doesNotMatch(client, /require\("\.\//)
 })
 
