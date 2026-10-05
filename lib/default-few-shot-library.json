@@ -1,0 +1,74 @@
+[
+  {
+    "id": "default-rewrite-debug",
+    "type": "rewrite",
+    "domain": "debugging",
+    "input": "启动很慢，帮我找原因",
+    "output": "检查应用启动路径和最近的改动，定位启动耗时最高的阶段，复现并记录测量结果；实施范围最小的修复，保留现有行为，并运行启动相关测试或给出可复现的验证命令。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-rewrite-ui",
+    "type": "rewrite",
+    "domain": "frontend",
+    "input": "页面样式改得更像原生一点",
+    "output": "检查当前页面与同一应用的原生设置页面在颜色、间距、边框、字体和交互状态上的差异，复用已有组件和设计变量完成一致化；覆盖浅色与深色模式，并用截图或可复现步骤验证主要状态没有回归。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-rewrite-research",
+    "type": "rewrite",
+    "domain": "research",
+    "input": "比较这几个 benchmark，看看哪个更适合我的问题",
+    "output": "根据我的研究目标逐项比较候选 benchmark 的任务定义、数据规模、输入输出、评测指标和可复现条件，区分论文明确支持的能力与需要自行推导的协议；最后给出选择结论、证据依据和仍需验证的缺口。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-rewrite-release",
+    "type": "rewrite",
+    "domain": "release",
+    "input": "检查一下发布包里有没有多余文件",
+    "output": "检查发布包的文件清单、忽略规则和构建产物来源，标出不应发布的缓存、凭据、个人路径和临时文件；修正打包配置后重新生成包，列出包内容并运行现有发布检查。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-task-coding",
+    "type": "task",
+    "domain": "coding",
+    "hint": "给这个功能加上测试",
+    "output": "先阅读该功能的入口、状态变化和现有测试约定，补充覆盖主流程、边界输入和失败路径的最小测试集合；运行相关测试并报告通过结果，测试失败时修复实现或明确剩余问题。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-task-data",
+    "type": "task",
+    "domain": "data",
+    "hint": "把这个批处理改成可恢复的",
+    "output": "检查批处理当前的输入枚举、输出写入和失败处理，加入稳定的项目标识、原子结果写入和已完成项目跳过逻辑；单条失败继续处理并记录错误，使用一个中断后重跑的样例验证结果不重复且不丢失。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-task-documents",
+    "type": "task",
+    "domain": "documents",
+    "hint": "把 README 补充完整一点",
+    "output": "根据实际安装、运行、配置和验证流程补齐 README，说明必要环境、最小启动命令、常见故障和项目结构；不要编造未实现的功能，运行文档中的命令并修正与当前代码不一致的内容。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  },
+  {
+    "id": "default-task-integration",
+    "type": "task",
+    "domain": "integration",
+    "hint": "把这个服务接到现有的消息流里",
+    "output": "梳理现有消息流的入口、事件格式、生命周期和错误边界，设计与当前约定一致的适配层；先实现最小端到端路径，保留原始事件和可追踪标识，使用本地 fixture 验证重复事件、断线重连和失败重试。",
+    "source": "curated-prompt-method",
+    "enabled": true
+  }
+]

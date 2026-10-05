@@ -1,0 +1,85 @@
+{
+  "name": "@panando/dsh-prompt-optimizer",
+  "version": "1.0.0",
+  "description": "One button prompt optimizer with configurable strategy.",
+  "type": "commonjs",
+  "main": "lib/index.cjs",
+  "exports": {
+    ".": "./lib/index.cjs",
+    "./client": "./lib/client.cjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
+    "test": "node --test",
+    "check": "npm run build && npm test && npm pack --dry-run --cache .npm-cache"
+  },
+  "dsh": {
+    "displayName": "提示词优化",
+    "description": "一键优化输入框草稿：把需求改写成更清晰、更可执行的提示词；模型与生成策略可配置。",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-client-runtime": ">=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-conversation": ">=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-settings-general": ">=0.2.0-rc.1 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-runtime": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-conversation": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-settings-general": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "prompt",
+    "prompt-optimizer",
+    "composer",
+    "few-shot",
+    "deepseek",
+    "copilot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/panando/dsh-prompt-optimizer.git"
+  },
+  "homepage": "https://github.com/panando/dsh-prompt-optimizer#readme",
+  "bugs": {
+    "url": "https://github.com/panando/dsh-prompt-optimizer/issues"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "license": "MIT"
+}

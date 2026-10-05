@@ -1,0 +1,27 @@
+# @panando/dsh-prompt-optimizer / 提示词优化
+- insert:
+    - id: prompt-optimizer
+      name: '@panando/dsh-prompt-optimizer'
+      config:
+        # Prompt optimization expands the instruction instead of summarising it.
+        maxCandidateBytes: 8192
+        maxDraftBytes: 32768
+        maxCurrentCycleSkipped: 10
+        maxCurrentCycleSkippedBytes: 16384
+        maxCurrentTurns: 3
+        maxCurrentContextBytes: 16384
+        maxCurrentFeedbackBytes: 4096
+        maxPreferenceMemoryBytes: 8192
+        maxHistorySessions: 20
+        maxManualPrompts: 8
+        maxEditedSuggestions: 6
+        maxAcceptedExact: 6
+        maxRejectedSuggestions: 4
+        maxLocalOutcomes: 50
+        maxLocalOutcomesBytes: 131072
+        maxProjectContextBytes: 16384
+        maxProjectTreeFiles: 100
+        maxOutputTokens: 2048
+        timeoutMs: 30000
+        automatic: false
+        # Optimize mode uses the selected DSH model and the embedded template.

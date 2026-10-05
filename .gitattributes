@@ -1,0 +1,20 @@
+# Keep text files consistent across platforms.
+* text=auto
+*.cjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.mjs text eol=lf
+*.patch.yml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Preserve binary assets as-is.
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.png binary
+*.webp binary
+*.woff binary
+*.woff2 binary

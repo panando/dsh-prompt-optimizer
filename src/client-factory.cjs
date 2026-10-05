@@ -1,0 +1,1918 @@
+'use strict'
+
+module.exports = function createClientPlugin(React, options) {
+  const RPC_PATH = '/dsh-prompt-optimizer/rpc'
+  const STORAGE_KEY = 'dsh.prompt-optimizer.outcomes.v2'
+  const LEGACY_STORAGE_KEY = 'dsh.prompt-optimizer.outcomes.v1'
+  const TRIGGER_COALESCE_MS = 250
+  const DEFAULT_USER_SETTINGS = Object.freeze({
+    automatic: Boolean(options && options.automatic === true),
+    route: null,
+    reasoningEffort: 'off',
+    projectContextEnabled: true,
+    projectContextDepth: 3,
+    maxProjectTreeFiles: 100,
+    maxProjectContextBytes: 16384,
+    maxOutputTokens: 2048,
+    timeoutMs: Number.isSafeInteger(options && options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : 30000,
+    fewShots: [],
+    optimizerPrompt: '',
+    optimizerFewShot: '',
+  })
+  const stores = new Map()
+  const config = {
+    maxCurrentCycleSkipped: 10,
+    maxCurrentCycleSkippedBytes: 16384,
+    maxLocalOutcomes: 50,
+    maxLocalOutcomesBytes: 131072,
+    projectContextEnabled: true,
+    projectContextDepth: 3,
+    maxProjectTreeFiles: 100,
+    maxProjectContextBytes: 16384,
+    maxOutputTokens: 2048,
+    timeoutMs: Number.isSafeInteger(options && options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : 30000,
+    automatic: Boolean(options && options.automatic === true),
+    reasoningEffort: 'off',
+    // Archived features. The Host ships the authoritative flags with the
+    // settings snapshot; the optimistic defaults keep an older Host working.
+    features: { projectContext: true, prediction: true },
+  }
+  let automaticPolicyReady = Boolean(options && typeof options.automatic === 'boolean')
+  let configurationRequest = null
+  const now = options && typeof options.now === 'function'
+    ? options.now
+    : () => (typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now())
+  const rpc = options && typeof options.rpc === 'function'
+    ? options.rpc
+    : async (method, args) => {
+        const response = await window.fetch(RPC_PATH, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ method, args: args || {} }),
+        })
+        return response.json()
+      }
+  const rpcWithTimeout = async (method, args, timeoutMs = 8000) => {
+    let timer
+    const operation = Promise.race([
+      rpc(method, args),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('rpc-timeout')), timeoutMs)
+      }),
+    ])
+    return operation.finally(() => clearTimeout(timer))
+  }
+  const streamGenerate = options && typeof options.generate === 'function'
+    ? options.generate
+    : async (args, onCandidate, signal, onDelta = () => {}) => {
+        const response = await window.fetch(RPC_PATH, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ method: 'generate', args }),
+          signal,
+        })
+        if (!response.ok) {
+          let failure
+          try {
+            failure = await response.json()
+          } catch {
+            failure = undefined
+          }
+          return {
+            ok: false,
+            message: failure && typeof failure.message === 'string'
+              ? failure.message
+              : 'Prompt Optimizer could not reach the Harness Host.',
+          }
+        }
+        if (!response.body || typeof response.body.getReader !== 'function') {
+          return { ok: false, message: 'Prompt Optimizer did not receive a suggestion stream.' }
+        }
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffered = ''
+        let completion
+
+        async function acceptLine(line) {
+          if (line.trim() === '') return
+          const event = JSON.parse(line)
+          if (event && event.type === 'candidate' && typeof event.candidate === 'string') {
+            await onCandidate(event.candidate)
+          } else if (event && event.type === 'delta' && typeof event.text === 'string') {
+            await onDelta(event.text)
+          } else if (event && event.type === 'done') {
+            completion = { ok: true, requestId: event.requestId }
+          } else if (event && event.type === 'error') {
+            completion = {
+              ok: false,
+              message: typeof event.message === 'string'
+                ? event.message
+                : 'Prompt Optimizer could not generate suggestions.',
+            }
+          }
+        }
+
+        while (true) {
+          const chunk = await reader.read()
+          buffered += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done })
+          let newline = buffered.indexOf('\n')
+          while (newline >= 0) {
+            const line = buffered.slice(0, newline).replace(/\r$/, '')
+            buffered = buffered.slice(newline + 1)
+            await acceptLine(line)
+            newline = buffered.indexOf('\n')
+          }
+          if (chunk.done) break
+        }
+        if (buffered.trim() !== '') await acceptLine(buffered)
+        return completion || { ok: false, message: 'Prompt Optimizer suggestion stream ended early.' }
+      }
+
+  function createSettingsController() {
+    let snapshot = {
+      status: 'loading', value: undefined, revision: 0, writable: false, defaults: null,
+    }
+    let generation = 0
+    let tail = Promise.resolve()
+    const listeners = new Set()
+    const publish = (next) => {
+      snapshot = next
+      for (const listener of [...listeners]) listener()
+    }
+    const accept = (result, expectedGeneration) => {
+      if (expectedGeneration !== generation || !result || result.ok !== true) return false
+      publish({
+        status: 'ready',
+        value: normalizeUserSettings(result.settings),
+        revision: snapshot.revision + 1,
+        writable: result.writable === true,
+        defaults: result.defaults || snapshot.defaults || null,
+      })
+      return true
+    }
+    const load = () => {
+      const expectedGeneration = ++generation
+      const task = tail.then(async () => {
+        try {
+          const result = await rpcWithTimeout('settings', {})
+          if (!accept(result, expectedGeneration) && expectedGeneration === generation
+            && snapshot.status !== 'ready') {
+            publish({ ...snapshot, status: 'unavailable', writable: false })
+          }
+        } catch {
+          if (expectedGeneration === generation && snapshot.status !== 'ready') {
+            publish({ ...snapshot, status: 'unavailable', writable: false })
+          }
+        }
+      })
+      tail = task.catch(() => {})
+      return task
+    }
+    const replace = (settings) => {
+      const expectedGeneration = ++generation
+      const task = tail.then(async () => {
+        let result
+        try {
+          result = await rpcWithTimeout('update-settings', { settings })
+        } catch {
+          result = undefined
+        }
+        if (!accept(result, expectedGeneration) && expectedGeneration === generation) {
+          const refreshGeneration = ++generation
+          try {
+            accept(await rpcWithTimeout('settings', {}), refreshGeneration)
+          } catch {
+            // The last good snapshot remains usable and the card reports that the save did not land.
+          }
+        }
+      })
+      tail = task.catch(() => {})
+      return task
+    }
+    return {
+      getSnapshot: () => snapshot,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+      load,
+      replace,
+    }
+  }
+
+  function storeFor(sessionId) {
+    let store = stores.get(sessionId)
+    if (!store) {
+      store = {
+        phase: 'idle',
+        error: null,
+        candidate: undefined,
+        candidateSkipped: false,
+        presentation: 'none',
+        suggestionId: undefined,
+        currentCycleSkipped: [],
+        sourceDraft: '',
+        requestDraft: '',
+        observedDraft: '',
+        observedPhase: null,
+        mode: 'predict',
+        streamingText: '',
+        streamCandidate: undefined,
+        streamOriginal: undefined,
+        streamHistory: [],
+        streamIndex: 0,
+        requestSeq: 0,
+        pending: false,
+        generationKind: null,
+        awaitingDraftAck: null,
+        lastAcceptedTriggerAt: null,
+        controller: null,
+        observedSuggestionId: undefined,
+        observedTurnSeeded: false,
+        seenTurnEndSeq: null,
+        pendingAutomaticTrigger: undefined,
+        automaticObservation: undefined,
+        listeners: new Set(),
+      }
+      stores.set(sessionId, store)
+    }
+    return store
+  }
+
+  function emit(store) {
+    for (const listener of [...store.listeners]) listener()
+  }
+
+  function migrateLegacyOutcome(raw) {
+    if (!raw || typeof raw !== 'object' || typeof raw.candidate !== 'string'
+      || raw.candidate === '') return undefined
+    if (raw.kind === 'submitted-exact') {
+      return {
+        sessionId: null,
+        action: 'submitted',
+        origin: 'suggestion-exact',
+        originalText: raw.candidate,
+        finalText: raw.candidate,
+        at: Number.isFinite(raw.at) ? raw.at : Date.now(),
+      }
+    }
+    if (raw.kind === 'submitted-edited' && typeof raw.resultingText === 'string'
+      && raw.resultingText !== '') {
+      return {
+        sessionId: null,
+        action: 'submitted',
+        origin: 'suggestion-edited',
+        originalText: raw.candidate,
+        finalText: raw.resultingText,
+        at: Number.isFinite(raw.at) ? raw.at : Date.now(),
+      }
+    }
+    if (raw.kind === 'cycled') {
+      return {
+        sessionId: null,
+        action: 'cycled',
+        origin: 'suggestion-exact',
+        originalText: raw.candidate,
+        at: Number.isFinite(raw.at) ? raw.at : Date.now(),
+      }
+    }
+    if (raw.kind === 'edited' && typeof raw.resultingText === 'string'
+      && raw.resultingText !== '') {
+      return {
+        sessionId: null,
+        action: 'cycled',
+        origin: 'suggestion-edited',
+        originalText: raw.candidate,
+        finalText: raw.resultingText,
+        at: Number.isFinite(raw.at) ? raw.at : Date.now(),
+      }
+    }
+    return undefined
+  }
+
+  function jsonBytes(value) {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength
+  }
+
+  function takeRecentWithinBudget(value, maxItems, maxBytes) {
+    if (!Array.isArray(value) || maxItems === 0) return []
+    const selected = []
+    for (let index = value.length - 1; index >= 0 && selected.length < maxItems; index -= 1) {
+      const candidate = [value[index], ...selected]
+      if (jsonBytes(candidate) <= maxBytes) selected.unshift(value[index])
+    }
+    return selected
+  }
+
+  function boundedOutcomes(value) {
+    return takeRecentWithinBudget(
+      value,
+      config.maxLocalOutcomes,
+      config.maxLocalOutcomesBytes,
+    )
+  }
+
+  function readOutcomes() {
+    try {
+      const current = window.localStorage.getItem(STORAGE_KEY)
+      if (current !== null) {
+        const parsed = JSON.parse(current)
+        const bounded = boundedOutcomes(parsed)
+        if (JSON.stringify(parsed) !== JSON.stringify(bounded)) {
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(bounded))
+        }
+        return bounded
+      }
+      const legacy = JSON.parse(window.localStorage.getItem(LEGACY_STORAGE_KEY) || '[]')
+      const migrated = boundedOutcomes((Array.isArray(legacy) ? legacy : [])
+        .map(migrateLegacyOutcome)
+        .filter(Boolean))
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated))
+      return migrated
+    } catch {
+      return []
+    }
+  }
+
+  function recordOutcome(sessionId, outcome) {
+    if (!outcome || typeof outcome !== 'object'
+      || (outcome.action !== 'submitted' && outcome.action !== 'cycled')
+      || (outcome.origin !== 'manual' && outcome.origin !== 'suggestion-exact'
+        && outcome.origin !== 'suggestion-edited')) return
+    const next = boundedOutcomes([...readOutcomes(), {
+      sessionId: typeof sessionId === 'string' && sessionId !== '' ? sessionId : null,
+      action: outcome.action,
+      origin: outcome.origin,
+      ...(typeof outcome.originalText === 'string' && outcome.originalText !== ''
+        ? { originalText: outcome.originalText }
+        : {}),
+      ...(typeof outcome.finalText === 'string' && outcome.finalText !== ''
+        ? { finalText: outcome.finalText }
+        : {}),
+      at: Date.now(),
+    }])
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      // Suggestion generation remains usable when local storage is unavailable.
+    }
+  }
+
+  function activeCandidate(store) {
+    return store.candidate
+  }
+
+  function setDraft(actions, text) {
+    if (actions && typeof actions.setDraft === 'function') actions.setDraft(text)
+  }
+
+  function pushStreamHistory(store, text) {
+    const history = store.streamHistory
+    if (history[store.streamIndex] === text) return
+    const next = history.slice(0, store.streamIndex + 1)
+    next.push(text)
+    if (next.length > 100) next.splice(0, next.length - 100)
+    store.streamHistory = next
+    store.streamIndex = next.length - 1
+  }
+
+  function beginManualStream(store, draft) {
+    store.mode = config.features.prediction !== false && draft.trim() === ''
+      ? 'predict'
+      : 'optimize'
+    store.streamingText = ''
+    store.streamCandidate = undefined
+    store.streamOriginal = draft
+    store.streamHistory = [draft]
+    store.streamIndex = 0
+  }
+
+  function appendManualStream(store, actions, text) {
+    const nextText = `${store.streamingText || ''}${text}`
+    store.streamingText = nextText
+    store.candidate = nextText
+    store.presentation = 'draft'
+    store.awaitingDraftAck = {
+      candidate: nextText,
+      previousDraft: store.streamOriginal,
+    }
+    pushStreamHistory(store, nextText)
+    setDraft(actions, nextText)
+    emit(store)
+  }
+
+  function finishManualStream(store, actions) {
+    const finalCandidate = typeof store.streamCandidate === 'string'
+      ? store.streamCandidate
+      : store.streamingText
+    if (typeof finalCandidate !== 'string' || finalCandidate.trim() === '') return false
+    if (finalCandidate !== store.streamingText) {
+      store.streamingText = finalCandidate
+      store.awaitingDraftAck = {
+        candidate: finalCandidate,
+        previousDraft: store.streamOriginal,
+      }
+      pushStreamHistory(store, finalCandidate)
+      setDraft(actions, finalCandidate)
+    }
+    store.candidate = finalCandidate
+    store.presentation = 'draft'
+    store.candidateSkipped = false
+    store.awaitingDraftAck = {
+      candidate: finalCandidate,
+      previousDraft: store.streamOriginal,
+    }
+    return true
+  }
+
+  function resetManualStream(store) {
+    store.mode = 'predict'
+    store.streamingText = ''
+    store.streamCandidate = undefined
+    store.streamOriginal = undefined
+    store.streamHistory = []
+    store.streamIndex = 0
+    store.candidate = undefined
+    store.awaitingDraftAck = null
+    store.presentation = 'none'
+  }
+
+  function stopManual(store, actions) {
+    if (!store.pending || store.generationKind !== 'manual') return false
+    const original = typeof store.streamOriginal === 'string'
+      ? store.streamOriginal
+      : store.requestDraft
+    cancelPending(store)
+    store.requestSeq += 1
+    resetManualStream(store)
+    if (typeof original === 'string') setDraft(actions, original)
+    store.phase = 'idle'
+    store.error = null
+    store.lastAcceptedTriggerAt = null
+    emit(store)
+    return true
+  }
+
+  function applyManualHistory(store, actions, direction) {
+    if (store.streamHistory.length < 2 || !Number.isFinite(direction)) return false
+    const nextIndex = Math.max(0, Math.min(
+      store.streamHistory.length - 1,
+      store.streamIndex + (direction < 0 ? -1 : 1),
+    ))
+    if (nextIndex === store.streamIndex) return false
+    const text = store.streamHistory[nextIndex]
+    store.streamIndex = nextIndex
+    store.streamingText = text
+    store.candidate = text
+    store.awaitingDraftAck = { candidate: text, previousDraft: store.streamOriginal }
+    setDraft(actions, text)
+    emit(store)
+    return true
+  }
+
+  function hasGenerationContext(session, draft, workspacePath = '') {
+    if (draft.trim() !== '') return true
+    if (session && session.blank === true && typeof workspacePath === 'string'
+      && workspacePath !== '') return true
+    if (session && typeof session.blank === 'boolean') {
+      return session.blank === false
+    }
+    const turnEnds = session && session.turnEnds
+    return !turnEnds || typeof turnEnds.size !== 'number' || turnEnds.size > 0
+  }
+
+  function offerSuggestion(actions, suggestion) {
+    if (!actions || typeof actions.offerSuggestion !== 'function') return false
+    try {
+      return actions.offerSuggestion(suggestion) === true
+    } catch {
+      return false
+    }
+  }
+
+  function dismissSuggestion(actions, id) {
+    if (!actions || typeof actions.dismissSuggestion !== 'function' || id === undefined) return false
+    try {
+      return actions.dismissSuggestion(id) === true
+    } catch {
+      return false
+    }
+  }
+
+  function cancelPending(store) {
+    if (store.controller) store.controller.abort()
+    store.controller = null
+    store.pending = false
+    store.generationKind = null
+    store.awaitingDraftAck = null
+  }
+
+  function showCandidate(sessionId, store, actions, candidate, kind) {
+    store.candidate = candidate
+    store.candidateSkipped = false
+    store.phase = store.pending ? 'loading' : 'ready'
+    store.error = null
+    if (kind === 'automatic') {
+      const suggestion = {
+        id: `dsh-prompt-optimizer:${sessionId}:${String(store.requestSeq)}`,
+        text: candidate,
+      }
+      store.suggestionId = suggestion.id
+      store.awaitingDraftAck = null
+      store.presentation = offerSuggestion(actions, suggestion) ? 'ghost' : 'fallback'
+    } else {
+      store.suggestionId = undefined
+      store.presentation = 'draft'
+      store.awaitingDraftAck = {
+        candidate,
+        previousDraft: store.observedDraft,
+      }
+      setDraft(actions, candidate)
+    }
+    emit(store)
+    return true
+  }
+
+  function clearCandidate(store, actions) {
+    if (store.presentation === 'ghost') dismissSuggestion(actions, store.suggestionId)
+    store.candidate = undefined
+    store.candidateSkipped = false
+    store.presentation = 'none'
+    store.suggestionId = undefined
+    store.awaitingDraftAck = null
+  }
+
+  function useFallback(store, actions) {
+    const candidate = activeCandidate(store)
+    if (candidate === undefined || store.presentation !== 'fallback') return false
+    store.presentation = 'draft'
+    store.awaitingDraftAck = { candidate, previousDraft: store.observedDraft }
+    setDraft(actions, candidate)
+    emit(store)
+    return true
+  }
+
+  function rememberSkipped(store, candidate) {
+    if (!store.currentCycleSkipped.includes(candidate)) store.currentCycleSkipped.push(candidate)
+    store.currentCycleSkipped = takeRecentWithinBudget(
+      store.currentCycleSkipped,
+      config.maxCurrentCycleSkipped,
+      config.maxCurrentCycleSkippedBytes,
+    )
+  }
+
+  async function requestSuggestion(sessionId, draft, actions, store, kind, triggerKind) {
+    cancelPending(store)
+    store.phase = 'loading'
+    store.error = null
+    store.requestDraft = draft
+    if (kind === 'manual') beginManualStream(store, draft)
+    store.pending = true
+    store.generationKind = kind
+    store.requestSeq += 1
+    const seq = store.requestSeq
+    const controller = new AbortController()
+    store.controller = controller
+    emit(store)
+    let result
+    let timedOut = false
+    let timeoutTimer
+    const timeoutMs = Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0
+      ? config.timeoutMs
+      : 30000
+    const generation = Promise.resolve().then(() => streamGenerate({
+      sessionId,
+      draft: store.sourceDraft,
+      mode: store.mode,
+      trigger: triggerKind,
+      currentCycleSkipped: [...store.currentCycleSkipped],
+      localOutcomes: readOutcomes(),
+    }, async (candidate) => {
+      if (seq !== store.requestSeq || controller.signal.aborted
+        || typeof candidate !== 'string' || candidate.trim() === '') return
+      if (kind === 'manual') store.streamCandidate = candidate.trim()
+      else showCandidate(sessionId, store, actions, candidate.trim(), kind)
+    }, controller.signal, async (text) => {
+      if (seq !== store.requestSeq || controller.signal.aborted
+        || typeof text !== 'string' || text === '' || kind !== 'manual') return
+      appendManualStream(store, actions, text)
+    }))
+    try {
+      result = await Promise.race([
+        generation,
+        new Promise((resolve) => {
+          timeoutTimer = setTimeout(() => {
+            timedOut = true
+            controller.abort()
+            resolve({ ok: false, message: 'Prompt Optimizer timed out.' })
+          }, timeoutMs)
+        }),
+      ])
+    } catch (error) {
+      if (controller.signal.aborted && !timedOut) return
+      result = { ok: false, message: 'Prompt Optimizer could not reach the Harness Host.' }
+    } finally {
+      clearTimeout(timeoutTimer)
+    }
+    if (seq !== store.requestSeq || (controller.signal.aborted && !timedOut)) return
+    store.pending = false
+    store.generationKind = null
+    store.controller = null
+    const manualCandidate = kind === 'manual'
+      ? (store.streamCandidate || store.streamingText || '')
+      : activeCandidate(store)
+    if (!result || result.ok !== true || typeof manualCandidate !== 'string'
+      || manualCandidate.trim() === '' || store.candidateSkipped) {
+      if (kind === 'manual' && typeof store.streamOriginal === 'string') {
+        setDraft(actions, store.streamOriginal)
+      }
+      resetManualStream(store)
+      store.phase = kind === 'automatic' ? 'idle' : 'error'
+      store.error = kind === 'automatic'
+        ? null
+        : result && typeof result.message === 'string'
+          ? result.message
+          : 'Prompt Optimizer could not generate suggestions.'
+      emit(store)
+      return
+    }
+    if (kind === 'manual') {
+      finishManualStream(store, actions)
+      store.streamCandidate = undefined
+    }
+    store.phase = 'ready'
+    store.error = null
+    emit(store)
+  }
+
+  async function trigger(sessionId, draft, actions) {
+    const store = storeFor(sessionId)
+    store.pendingAutomaticTrigger = undefined
+    if (stopManual(store, actions)) return
+    if (store.pending) {
+      cancelPending(store)
+      store.requestSeq += 1
+    }
+    const triggerAt = now()
+    if (store.lastAcceptedTriggerAt !== null
+      && triggerAt - store.lastAcceptedTriggerAt < TRIGGER_COALESCE_MS) return
+    store.lastAcceptedTriggerAt = triggerAt
+    store.observedDraft = draft
+    const candidate = activeCandidate(store)
+    if (candidate !== undefined) {
+      if (!store.candidateSkipped) {
+        recordOutcome(sessionId, {
+          action: 'cycled',
+          origin: 'suggestion-exact',
+          originalText: candidate,
+        })
+        rememberSkipped(store, candidate)
+        store.candidateSkipped = true
+      }
+      const directCandidate = store.presentation === 'draft' && draft === candidate
+      store.sourceDraft = directCandidate ? store.sourceDraft : draft
+      clearCandidate(store, actions)
+    } else {
+      store.sourceDraft = draft
+      if (store.phase !== 'error' || store.requestDraft !== draft) store.currentCycleSkipped = []
+    }
+    await requestSuggestion(sessionId, draft, actions, store, 'manual', { kind: 'manual' })
+  }
+
+  function idlePhase(phase) {
+    return phase === 'plain' || phase === 'idle'
+  }
+
+  function latestTurnEnd(turnEnds) {
+    if (!turnEnds || typeof turnEnds[Symbol.iterator] !== 'function') return undefined
+    let latest
+    for (const entry of turnEnds) {
+      if (!Array.isArray(entry) || !Number.isSafeInteger(entry[0]) || !Number.isSafeInteger(entry[1])) continue
+      if (latest === undefined || entry[1] > latest.endSeq) latest = { turn: entry[0], endSeq: entry[1] }
+    }
+    return latest
+  }
+
+  function semanticComposerIsEmpty(input) {
+    return input.draft === '' && idlePhase(input.phase)
+      && (!Array.isArray(input.imageIds) || input.imageIds.length === 0)
+      && (!Array.isArray(input.queue) || input.queue.length === 0)
+  }
+
+  function maybeStartAutomatic(store) {
+    const triggerKind = store.pendingAutomaticTrigger
+    const observation = store.automaticObservation
+    if (triggerKind === undefined || observation === undefined
+      || !automaticPolicyReady || !config.automatic
+      || observation.automaticEligible !== true
+      || observation.session.running === true || observation.session.removed === true
+      || !semanticComposerIsEmpty(observation.input)
+      || activeCandidate(store) !== undefined || store.pending) return false
+    store.pendingAutomaticTrigger = undefined
+    store.sourceDraft = ''
+    store.currentCycleSkipped = []
+    void requestSuggestion(
+      observation.sessionId,
+      observation.input.draft,
+      observation.actions,
+      store,
+      'automatic',
+      triggerKind,
+    )
+    return true
+  }
+
+  function applyConfiguration(result) {
+    if (!result || result.ok !== true) return false
+    const automaticWasEnabled = config.automatic
+    if (typeof result.automatic === 'boolean') config.automatic = result.automatic
+    if (typeof result.projectContextEnabled === 'boolean') {
+      config.projectContextEnabled = result.projectContextEnabled
+    }
+    if (Number.isSafeInteger(result.maxCurrentCycleSkipped)
+      && result.maxCurrentCycleSkipped >= 1) {
+      config.maxCurrentCycleSkipped = result.maxCurrentCycleSkipped
+    }
+    if (Number.isSafeInteger(result.maxCurrentCycleSkippedBytes)
+      && result.maxCurrentCycleSkippedBytes >= 256) {
+      config.maxCurrentCycleSkippedBytes = result.maxCurrentCycleSkippedBytes
+    }
+    if (Number.isSafeInteger(result.maxLocalOutcomes) && result.maxLocalOutcomes >= 0) {
+      config.maxLocalOutcomes = result.maxLocalOutcomes
+    }
+    if (Number.isSafeInteger(result.maxLocalOutcomesBytes)
+      && result.maxLocalOutcomesBytes >= 256) {
+      config.maxLocalOutcomesBytes = result.maxLocalOutcomesBytes
+    }
+    if (Number.isSafeInteger(result.timeoutMs) && result.timeoutMs > 0) {
+      config.timeoutMs = result.timeoutMs
+    }
+    automaticPolicyReady = true
+    for (const store of stores.values()) {
+      if (config.automatic) maybeStartAutomatic(store)
+      else {
+        let changed = false
+        store.pendingAutomaticTrigger = undefined
+        if (store.pending && store.generationKind === 'automatic') {
+          cancelPending(store)
+          store.requestSeq += 1
+          store.phase = 'idle'
+          store.error = null
+          changed = true
+        }
+        if (store.presentation === 'ghost' || store.presentation === 'fallback'
+          || store.presentation === 'hidden') {
+          const actions = store.automaticObservation && store.automaticObservation.actions
+          clearCandidate(store, actions)
+          store.phase = 'idle'
+          store.error = null
+          changed = true
+        }
+        if (changed || automaticWasEnabled) emit(store)
+      }
+    }
+    return true
+  }
+
+  function ensureConfiguration(force = false) {
+    if (!force && automaticPolicyReady) return configurationRequest
+    if (configurationRequest !== null) return configurationRequest
+    configurationRequest = Promise.resolve()
+      .then(() => rpcWithTimeout('configuration', {}))
+      .then((result) => { applyConfiguration(result) })
+      .catch(() => {})
+      .finally(() => { configurationRequest = null })
+    return configurationRequest
+  }
+
+  function observe(sessionId, inputValue, sessionValue, actions, automaticEligible = true) {
+    const legacy = typeof inputValue === 'string'
+    const input = legacy
+      ? { draft: inputValue, phase: sessionValue, imageIds: [], queue: [] }
+      : (inputValue || {})
+    const session = legacy
+      ? { running: false, removed: false, turnEnds: new Map() }
+      : (sessionValue || { running: false, removed: false, turnEnds: new Map() })
+    const draft = typeof input.draft === 'string' ? input.draft : ''
+    const phase = typeof input.phase === 'string' ? input.phase : 'idle'
+    const store = storeFor(sessionId)
+    store.automaticObservation = { sessionId, input, session, actions, automaticEligible }
+    if (!automaticPolicyReady) void ensureConfiguration()
+    if (session.removed === true) store.pendingAutomaticTrigger = undefined
+    const previousDraft = store.observedDraft
+    const previousSuggestionId = store.observedSuggestionId
+    const currentSuggestionId = input.suggestion && typeof input.suggestion.id === 'string'
+      ? input.suggestion.id
+      : undefined
+    const enteringSubmission = phase === 'submitting' && store.observedPhase !== 'submitting'
+    if (enteringSubmission) store.pendingAutomaticTrigger = undefined
+    store.observedDraft = draft
+    store.observedPhase = phase
+    store.observedSuggestionId = currentSuggestionId
+    let stateChanged = false
+    const draftAck = store.awaitingDraftAck
+    if (draftAck !== null && draft === draftAck.candidate) {
+      store.awaitingDraftAck = null
+      stateChanged = true
+    } else if (draftAck !== null && draft !== draftAck.previousDraft) {
+      store.awaitingDraftAck = null
+      if (phase !== 'adjudicating' && phase !== 'submitting') store.phase = 'ready'
+      stateChanged = true
+    }
+
+    let candidate = activeCandidate(store)
+    if (candidate !== undefined && (store.presentation === 'ghost'
+      || store.presentation === 'fallback' || store.presentation === 'hidden')) {
+      const visibleBefore = previousSuggestionId === store.suggestionId
+      const visibleNow = currentSuggestionId === store.suggestionId
+      if (session.running === true || session.removed === true || automaticEligible !== true
+        || (Array.isArray(input.queue) && input.queue.length > 0)) {
+        clearCandidate(store, actions)
+        store.phase = 'idle'
+        store.error = null
+        candidate = undefined
+        stateChanged = true
+      } else if (visibleBefore && !visibleNow && draft === candidate) {
+        store.presentation = 'draft'
+        stateChanged = true
+      } else if (!semanticComposerIsEmpty(input)) {
+        store.presentation = 'hidden'
+        store.phase = 'idle'
+        stateChanged = true
+      } else if (store.presentation === 'ghost' && visibleBefore && !visibleNow) {
+        clearCandidate(store, actions)
+        store.phase = 'idle'
+        candidate = undefined
+        stateChanged = true
+      } else if (store.presentation === 'hidden') {
+        const suggestion = { id: store.suggestionId, text: candidate }
+        store.presentation = offerSuggestion(actions, suggestion) ? 'ghost' : 'fallback'
+        store.phase = 'ready'
+        stateChanged = true
+      }
+    }
+
+    candidate = activeCandidate(store)
+    if (candidate !== undefined && store.presentation === 'draft' && enteringSubmission) {
+      recordOutcome(sessionId, {
+        action: 'submitted',
+        origin: draft === candidate ? 'suggestion-exact' : 'suggestion-edited',
+        originalText: candidate,
+        finalText: draft,
+      })
+      cancelPending(store)
+      clearCandidate(store, actions)
+      store.currentCycleSkipped = []
+      store.sourceDraft = ''
+      store.requestDraft = ''
+      store.phase = 'idle'
+      stateChanged = true
+    } else if (candidate === undefined && enteringSubmission) {
+      if (draft.trim() !== '') {
+        recordOutcome(sessionId, { action: 'submitted', origin: 'manual', finalText: draft })
+      }
+      const wasPending = store.pending
+      cancelPending(store)
+      if (wasPending) store.requestSeq += 1
+      store.currentCycleSkipped = []
+      store.sourceDraft = ''
+      store.requestDraft = ''
+      store.phase = 'idle'
+      store.error = null
+      if (wasPending) stateChanged = true
+    } else if (store.pending && previousDraft === store.requestDraft && draft !== store.requestDraft) {
+      cancelPending(store)
+      store.requestSeq += 1
+      store.phase = candidate === undefined ? 'idle' : 'ready'
+      store.error = null
+      stateChanged = true
+    } else if (candidate !== undefined && store.presentation === 'draft'
+      && previousDraft === candidate && draft !== candidate
+      && phase !== 'adjudicating' && phase !== 'submitting') {
+      store.phase = 'ready'
+      stateChanged = true
+    }
+
+    const latest = latestTurnEnd(session.turnEnds)
+    if (!store.observedTurnSeeded) {
+      store.observedTurnSeeded = true
+      store.seenTurnEndSeq = latest ? latest.endSeq : null
+    } else if (latest && latest.endSeq !== store.seenTurnEndSeq && session.running !== true) {
+      store.seenTurnEndSeq = latest.endSeq
+      const hadCandidate = activeCandidate(store) !== undefined
+      const hadPending = store.pending
+      if (hadPending) {
+        cancelPending(store)
+        store.requestSeq += 1
+      }
+      if (hadCandidate) clearCandidate(store, actions)
+      if (hadCandidate || hadPending) {
+        store.sourceDraft = ''
+        store.requestDraft = ''
+        store.phase = 'idle'
+        store.error = null
+        stateChanged = true
+      }
+      store.pendingAutomaticTrigger = (!automaticPolicyReady || config.automatic)
+        ? { kind: 'automatic', turn: latest.turn, endSeq: latest.endSeq }
+        : undefined
+    }
+    if (maybeStartAutomatic(store)) return
+    if (stateChanged) emit(store)
+  }
+
+  function isChinese() {
+    try {
+      return document.documentElement.lang.toLowerCase().startsWith('zh')
+    } catch {
+      return false
+    }
+  }
+
+  function tooltipText(store, zh) {
+    if (store.phase === 'error') return zh ? '生成失败，点击重试' : 'Generation failed. Click to retry'
+    if (store.phase === 'loading' && store.generationKind === 'automatic') {
+      return zh ? '立即生成并写入' : 'Generate now and fill'
+    }
+    if (store.phase === 'loading') return zh ? '正在生成…' : 'Generating…'
+    const action = store.presentation === 'ghost'
+      ? (zh ? '换一个并写入' : 'Try another and fill')
+      : activeCandidate(store) === undefined
+      ? (zh ? '生成下一句' : 'Generate next message')
+      : (zh ? '换一条' : 'Try another')
+    return action
+  }
+
+  const CSS = [
+    '.dsh-po-button{display:inline-flex;align-items:center;justify-content:center;order:1;width:28px;height:28px;padding:0;border:0;border-radius:7px;background:transparent;color:inherit;cursor:pointer;opacity:.82}',
+    '.uV2eYG_trailing>.uV2eYG_primary{order:2}',
+    '.dsh-po-button:hover{background:color-mix(in srgb,currentColor 9%,transparent);opacity:1}',
+    '.dsh-po-button:disabled{cursor:default;opacity:.4}',
+    '.dsh-po-button[data-error="true"]{color:#d94b4b}',
+    '.dsh-po-icon{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}',
+    '.dsh-po-button[data-loading="true"] .dsh-po-icon{animation:dsh-po-spin 1s linear infinite}',
+    '.dsh-po-preview{display:flex;align-items:flex-start;gap:10px;margin:0 0 8px;padding:10px 12px;border:1px solid color-mix(in srgb,currentColor 14%,transparent);border-radius:10px;background:color-mix(in srgb,currentColor 4%,transparent)}',
+    '.dsh-po-preview-text{flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;opacity:.72;font-size:13px;line-height:1.45}',
+    '.dsh-po-preview-actions{display:flex;gap:6px}',
+    '.dsh-po-preview-action{border:0;border-radius:7px;padding:5px 9px;background:color-mix(in srgb,currentColor 10%,transparent);color:inherit;cursor:pointer;font:inherit;font-size:12px}',
+    '.dsh-po-settings-card{list-style:none;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-3);transition:border-color .16s,background .16s}',
+    '.dsh-po-settings-page{max-width:720px;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family,inherit)}',
+    '.dsh-po-settings-panel-header{display:flex;align-items:flex-start;gap:16px;margin-bottom:16px}',
+    '.dsh-po-settings-panel-header .dsh-po-settings-name{margin:0;font-size:18px;font-weight:600;line-height:1.4}',
+    '.dsh-po-settings-panel-header .dsh-po-settings-description{margin:5px 0 0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+    '.dsh-po-settings-panel-body{display:flex;flex-direction:column}',
+    '.dsh-po-settings-card:hover,.dsh-po-settings-card[data-open="true"]{border-color:var(--dsw-alias-label-dimmed)}',
+    '.dsh-po-settings-card[data-open="true"]{background:var(--dsw-alias-bg-layer-2)}',
+    '.dsh-po-settings-header{width:100%;appearance:none;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer;display:flex;align-items:center;gap:12px;padding:14px 16px;border-radius:12px}',
+    '.dsh-po-settings-header:focus-visible,.dsh-po-settings-button:focus-visible,.dsh-po-settings-choice:focus-within,.dsh-po-switch input:focus-visible+span{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
+    '.dsh-po-settings-head-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}',
+    '.dsh-po-settings-name{font-size:15px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary)}',
+    '.dsh-po-settings-description{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+    '.dsh-po-settings-pending{flex:none;border-radius:999px;padding:1px 8px;font-size:11px;line-height:17px;font-weight:500;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary)}',
+    '.dsh-po-settings-chevron{flex:none;color:var(--dsw-alias-label-tertiary);font-size:16px;transition:transform .16s}',
+    '.dsh-po-settings-chevron[data-open="true"]{transform:rotate(180deg)}',
+    '.dsh-po-settings-body{border-top:1px solid var(--dsw-alias-border-l2);margin:0 16px;padding-bottom:8px}',
+    '.dsh-po-settings-section-title{margin:18px 0 2px;font-size:12px;font-weight:650;line-height:18px;letter-spacing:.02em;color:var(--dsw-alias-label-secondary)}',
+    '.dsh-po-settings-panel-body>.dsh-po-settings-section-title:first-of-type{margin-top:6px}',
+    '.dsh-po-settings-row{display:flex;align-items:flex-start;gap:18px;padding:14px 0}',
+    '.dsh-po-settings-row+.dsh-po-settings-row,.dsh-po-settings-advanced{border-top:1px solid var(--dsw-alias-border-l2)}',
+    '.dsh-po-settings-model-control{display:flex;flex-direction:column;gap:8px;flex:0 1 360px;width:100%;max-width:360px;min-width:280px}',
+    '.dsh-po-settings-copy{flex:1 1 0;min-width:0;display:flex;flex-direction:column;gap:3px}',
+    '.dsh-po-settings-label{font-size:13px;font-weight:500;line-height:1.5;color:var(--dsw-alias-label-primary)}',
+    '.dsh-po-settings-hint,.dsh-po-settings-status{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
+    '.dsh-po-settings-status[data-error="true"]{color:var(--dsw-alias-label-error)}',
+    '.dsh-po-settings-warning{color:var(--dsw-alias-state-warn-label)}',
+    '.dsh-po-switch{position:relative;display:inline-flex;flex:none;width:36px;height:20px}',
+    '.dsh-po-switch input{position:absolute;opacity:0;pointer-events:none}',
+    '.dsh-po-switch span{width:36px;height:20px;border-radius:999px;background:var(--dsw-alias-border-l1);transition:background .16s;box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}',
+    '.dsh-po-switch span:after{content:"";display:block;width:16px;height:16px;margin:2px;border-radius:50%;background:var(--dsw-alias-bg-layer-3);box-shadow:0 1px 3px color-mix(in srgb,#000 24%,transparent);transition:transform .16s}',
+    '.dsh-po-switch input:checked+span{background:var(--dsw-alias-brand-primary)}',
+    '.dsh-po-switch input:checked+span:after{transform:translateX(16px)}',
+    '.dsh-po-switch input:disabled+span{opacity:.45}',
+    '.dsh-po-settings-button{appearance:none;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;min-height:34px;padding:5px 12px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}',
+    '.dsh-po-settings-button:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed)}',
+    '.dsh-po-settings-button:disabled{opacity:.45;cursor:default}',
+    '.dsh-po-settings-key{min-width:120px;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
+    // Disclosure styling mirrors dsh-client-ui-settings-models'
+    // native customized details/summary baseline.
+    '.dsh-po-settings-advanced{border-top:.5px solid var(--dsw-alias-border-l2);padding-top:10px}',
+    '.dsh-po-settings-advanced-toggle{cursor:pointer;width:fit-content;color:var(--dsw-alias-label-secondary);border-radius:6px;align-items:center;gap:6px;margin-left:-4px;padding:2px 4px;font-size:12px;font-weight:500;line-height:18px;list-style:none;display:flex}',
+    '.dsh-po-settings-advanced-toggle::-webkit-details-marker{display:none}',
+    '.dsh-po-settings-advanced-toggle::before{content:"";border-bottom:1.5px solid;border-right:1.5px solid;width:5px;height:5px;transition:transform .12s;transform:rotate(-45deg)translate(-1px,-1px)}',
+    '.dsh-po-settings-advanced[open]>.dsh-po-settings-advanced-toggle::before{transform:rotate(45deg)translate(-1px,-1px)}',
+    '.dsh-po-settings-advanced-toggle:hover{color:var(--dsw-alias-label-primary)}',
+    '.dsh-po-settings-advanced-body{display:flex;flex-direction:column;gap:12px;padding-top:12px}',
+    '.dsh-po-settings-advanced-body .dsh-po-settings-row{padding:0}',
+    '.dsh-po-settings-advanced-body .dsh-po-settings-row+.dsh-po-settings-row{border-top:0}',
+    '.dsh-po-settings-fewshots{display:flex;flex-direction:column;gap:10px;padding-top:4px}',
+    '.dsh-po-settings-template{min-height:150px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;white-space:pre;overflow:auto}',
+    '.dsh-po-settings-badge{align-self:flex-start;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:2px 8px;font-size:11px;color:var(--dsw-alias-label-secondary)}',
+    '.dsh-po-settings-badge[data-custom="true"]{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-primary)}',
+    '.dsh-po-settings-fewshots-header{display:flex;align-items:center;justify-content:space-between;gap:12px}',
+    '.dsh-po-settings-fewshots-title{font-size:13px;font-weight:600}',
+    '.dsh-po-settings-fewshot{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px}',
+    '.dsh-po-settings-fewshot-field{grid-column:1/-1;display:flex;flex-direction:column;gap:5px;min-width:0}',
+    '.dsh-po-settings-fewshot-controls{display:flex;align-items:center;gap:8px}',
+    '.dsh-po-settings-textarea{width:100%;min-height:76px;resize:vertical;box-sizing:border-box;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:1.5}',
+    '.dsh-po-settings-textarea:focus-visible{outline:none;border-color:var(--dsw-alias-brand-primary)}',
+    '.dsh-po-settings-choices{width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:0 0 12px}',
+    '.dsh-po-settings-choice{position:relative;display:flex;flex-direction:column;gap:3px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:9px;cursor:pointer;background:var(--dsw-alias-bg-layer-3)}',
+    '.dsh-po-settings-choice[data-selected="true"]{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 7%,var(--dsw-alias-bg-layer-3))}',
+    '.dsh-po-settings-choice input{position:absolute;opacity:0;pointer-events:none}',
+    '.dsh-po-settings-choice strong{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+    '.dsh-po-settings-choice small{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-tertiary)}',
+    '.dsh-po-settings-select{width:100%;max-width:240px;flex:0 1 240px;height:36px;margin:0 0 12px;padding:0 34px 0 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
+    // Inside the column-flex model control the shared `flex:0 1 240px` basis
+    // would be applied to the main axis (height) and stretch the select to
+    // 240px tall. Pin it back to an intrinsic, single-row height, and drop the
+    // 240px cap so it spans the full control width: both edges then line up
+    // with the choice cards above.
+    '.dsh-po-settings-model-control>.dsh-po-settings-select{flex:none;height:36px;margin:0;max-width:none}',
+    '.dsh-po-settings-select:focus-visible{outline:none;border-color:var(--dsw-alias-brand-primary)}',
+    '.dsh-po-settings-model-refresh{align-self:flex-start;margin-bottom:12px}',
+    '.dsh-po-settings-input{height:34px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
+    '.dsh-po-settings-input:focus-visible{outline:none;border-color:var(--dsw-alias-brand-primary)}',
+    '.dsh-po-settings-number{width:116px}',
+    '.dsh-po-settings-footer{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 0 4px;border-top:1px solid var(--dsw-alias-border-l2)}',
+    '.dsh-po-settings-footer .dsh-po-settings-status{flex:1}',
+    '.dsh-po-settings-save{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3);border-color:transparent}',
+    '@media(max-width:620px){.dsh-po-settings-row{align-items:flex-start;flex-direction:column;gap:9px}.dsh-po-settings-choices{grid-template-columns:1fr}}',
+    '@keyframes dsh-po-spin{to{transform:rotate(360deg)}}',
+    '@media(prefers-reduced-motion:reduce){.dsh-po-button[data-loading="true"] .dsh-po-icon{animation:none}}',
+  ].join('')
+
+  function insertStyles() {
+    if (document.querySelector('style[data-plugin-css="dsh-prompt-optimizer"]')) return
+    const tag = document.createElement('style')
+    tag.dataset.plugin = 'dsh-prompt-optimizer'
+    tag.dataset.pluginCss = 'dsh-prompt-optimizer'
+    tag.textContent = CSS
+    document.head.appendChild(tag)
+  }
+
+  function SparklesIcon() {
+    return React.createElement('svg', {
+      className: 'dsh-po-icon',
+      viewBox: '0 0 24 24',
+      'aria-hidden': 'true',
+    },
+    React.createElement('path', { d: 'M12 3l1.2 3.3L16.5 7.5l-3.3 1.2L12 12l-1.2-3.3-3.3-1.2 3.3-1.2L12 3z' }),
+    React.createElement('path', { d: 'M18.5 13l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z' }),
+    React.createElement('path', { d: 'M5.5 14l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8z' }))
+  }
+
+  /** 随时生成/优化：草稿非空时优化原始 prompt；草稿为空且已有上下文时预测下一步。 */
+  function ForcePromptButton(props) {
+    const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+    const input = typeof props.useInput === 'function'
+      ? props.useInput((value) => value)
+      : undefined
+    const session = typeof props.useSession === 'function'
+      ? props.useSession((value) => value)
+      : undefined
+    const workspaces = typeof props.useWorkspaces === 'function'
+      ? props.useWorkspaces((value) => value)
+      : undefined
+    const workspacePath = Array.isArray(workspaces && workspaces.items)
+      && workspaces.items.length > 0
+      ? (workspaces.items[0].path || '')
+      : ''
+    const actions = props && props.inputActions
+    const draft = typeof input.draft === 'string' ? input.draft : ''
+    const [, rerender] = React.useReducer((value) => value + 1, 0)
+    const buttonRef = React.useRef(null)
+    const store = storeFor(sessionId)
+    const zh = isChinese()
+    const locked = store.pending && store.generationKind === 'manual'
+    const contextReady = hasGenerationContext(
+      session,
+      draft,
+      config.projectContextEnabled ? workspacePath : '',
+    )
+    const disabled = !locked && !contextReady
+    React.useEffect(() => {
+      const listener = () => rerender()
+      store.listeners.add(listener)
+      return () => {
+        store.listeners.delete(listener)
+        if (store.listeners.size === 0) {
+          cancelPending(store)
+          store.requestSeq += 1
+          stores.delete(sessionId)
+        }
+      }
+    }, [sessionId, store])
+    React.useEffect(() => {
+      const card = buttonRef.current && buttonRef.current.closest('[data-composer-card]')
+      const editor = card && (card.querySelector('[data-composer-input]') || card.querySelector('textarea'))
+      if (!editor) return undefined
+      const onKeyDown = (event) => {
+        if (event.isComposing || event.repeat) return
+        const ctrl = event.ctrlKey || event.metaKey
+        const key = typeof event.key === 'string' ? event.key.toLowerCase() : ''
+        const undo = ctrl && !event.shiftKey && key === 'z'
+        const redo = ctrl && (key === 'y' || (event.shiftKey && key === 'z'))
+        const hasHistory = store.streamHistory.length > 1
+        if (undo && hasHistory) {
+          event.preventDefault()
+          event.stopPropagation()
+          applyManualHistory(store, actions, -1)
+          return
+        }
+        if (redo && hasHistory) {
+          event.preventDefault()
+          event.stopPropagation()
+          applyManualHistory(store, actions, 1)
+          return
+        }
+        if (locked) {
+          event.preventDefault()
+          event.stopPropagation()
+        }
+      }
+      const onBeforeInput = (event) => {
+        if (locked) event.preventDefault()
+      }
+      editor.addEventListener('keydown', onKeyDown, true)
+      editor.addEventListener('beforeinput', onBeforeInput, true)
+      return () => {
+        editor.removeEventListener('keydown', onKeyDown, true)
+        editor.removeEventListener('beforeinput', onBeforeInput, true)
+      }
+    }, [locked, sessionId, store, actions])
+    if (sessionId === undefined || !actions || typeof actions.setDraft !== 'function') return null
+    // Prediction is archived, so the button copy follows the Host flags.
+    const label = config.features.prediction !== false && draft.trim() === ''
+      ? (zh ? '设计提示词' : 'Design prompt')
+      : (zh ? '优化提示词' : 'Optimize prompt')
+    const loading = locked && store.phase === 'loading'
+    const failed = store.phase === 'error'
+    const title = disabled
+      ? (zh ? '新会话没有足够上下文，请先输入任务' : 'New session needs a draft first')
+      : loading
+      ? (zh ? '正在生成…' : 'Generating…')
+      : failed
+      ? (zh ? '生成失败，点击重试' : 'Generation failed. Click to retry')
+      : label
+    return React.createElement('button', {
+      ref: buttonRef,
+      type: 'button',
+      className: 'dsh-po-button dsh-po-force',
+      title,
+      'aria-label': title,
+      'data-force': 'true',
+      'data-loading': String(loading),
+      'data-error': String(failed),
+      'data-locked': String(locked),
+      'aria-disabled': String(disabled),
+      disabled,
+      onClick: () => {
+        if (stopManual(store, actions)) return
+        void trigger(sessionId, draft, actions)
+      },
+    }, React.createElement(SparklesIcon))
+  }
+
+  function PromptOptimizerButton(props) {
+    const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+    const actions = props && props.inputActions
+    if (sessionId === undefined || !actions || typeof actions.setDraft !== 'function') return null
+    return React.createElement(ForcePromptButton, props)
+  }
+
+  function PromptOptimizerPreview(props) {
+    const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+    const actions = props && props.inputActions
+    const [, rerender] = React.useReducer((value) => value + 1, 0)
+    const store = storeFor(sessionId)
+    React.useEffect(() => {
+      const listener = () => rerender()
+      store.listeners.add(listener)
+      return () => {
+        store.listeners.delete(listener)
+        if (store.listeners.size === 0) {
+          cancelPending(store)
+          store.requestSeq += 1
+          stores.delete(sessionId)
+        }
+      }
+    }, [sessionId, store])
+    if (sessionId === undefined || !actions || store.presentation !== 'fallback'
+      || activeCandidate(store) === undefined) return null
+    const zh = isChinese()
+    return React.createElement('div', { className: 'dsh-po-preview', role: 'status' },
+      React.createElement('div', { className: 'dsh-po-preview-text' }, activeCandidate(store)),
+      React.createElement('div', { className: 'dsh-po-preview-actions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh-po-preview-action',
+          onClick: () => useFallback(store, actions),
+        }, zh ? '采用' : 'Use'),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh-po-preview-action',
+          'aria-label': zh ? '关闭建议' : 'Dismiss suggestion',
+          onClick: () => { clearCandidate(store, actions); store.phase = 'idle'; emit(store) },
+        }, '×')))
+  }
+
+  function normalizeUserSettings(value) {
+    const source = value && typeof value === 'object' ? value : {}
+    const route = source.route && typeof source.route === 'object'
+      && typeof source.route.provider === 'string' && source.route.provider !== ''
+      && typeof source.route.model === 'string' && source.route.model !== ''
+      ? { provider: source.route.provider, model: source.route.model }
+      : null
+    return {
+      automatic: typeof source.automatic === 'boolean' ? source.automatic : DEFAULT_USER_SETTINGS.automatic,
+      route,
+      reasoningEffort: ['inherit', 'off', 'low', 'high', 'max'].includes(source.reasoningEffort)
+        ? source.reasoningEffort
+        : DEFAULT_USER_SETTINGS.reasoningEffort,
+      projectContextEnabled: typeof source.projectContextEnabled === 'boolean'
+        ? source.projectContextEnabled
+        : DEFAULT_USER_SETTINGS.projectContextEnabled,
+      projectContextDepth: Number.isSafeInteger(source.projectContextDepth)
+        ? source.projectContextDepth
+        : DEFAULT_USER_SETTINGS.projectContextDepth,
+      maxProjectTreeFiles: Number.isSafeInteger(source.maxProjectTreeFiles)
+        ? source.maxProjectTreeFiles
+        : DEFAULT_USER_SETTINGS.maxProjectTreeFiles,
+      maxProjectContextBytes: Number.isSafeInteger(source.maxProjectContextBytes)
+        ? source.maxProjectContextBytes
+        : DEFAULT_USER_SETTINGS.maxProjectContextBytes,
+      maxOutputTokens: Number.isSafeInteger(source.maxOutputTokens)
+        ? source.maxOutputTokens
+        : DEFAULT_USER_SETTINGS.maxOutputTokens,
+      timeoutMs: Number.isSafeInteger(source.timeoutMs)
+        ? source.timeoutMs
+        : DEFAULT_USER_SETTINGS.timeoutMs,
+      fewShots: Array.isArray(source.fewShots)
+        ? source.fewShots.filter((item) => item
+          && typeof item.id === 'string'
+          && (item.type === 'rewrite' || item.type === 'task')
+          && typeof item.enabled === 'boolean'
+          && typeof item.output === 'string'
+          && typeof (item.type === 'rewrite' ? item.input : item.hint) === 'string')
+          .slice(0, 16)
+          .map((item, index) => ({
+            id: item.id || `few-shot-${index + 1}`,
+            type: item.type,
+            enabled: item.enabled,
+            ...(item.type === 'rewrite' ? { input: item.input } : { hint: item.hint }),
+            output: item.output,
+          }))
+        : [],
+      optimizerPrompt: typeof source.optimizerPrompt === 'string' ? source.optimizerPrompt : '',
+      optimizerFewShot: typeof source.optimizerFewShot === 'string' ? source.optimizerFewShot : '',
+    }
+  }
+
+  function sameUserSettings(left, right) {
+    return left.automatic === right.automatic
+      && left.reasoningEffort === right.reasoningEffort
+      && left.projectContextEnabled === right.projectContextEnabled
+      && left.projectContextDepth === right.projectContextDepth
+      && left.maxProjectTreeFiles === right.maxProjectTreeFiles
+      && left.maxProjectContextBytes === right.maxProjectContextBytes
+      && left.maxOutputTokens === right.maxOutputTokens
+      && left.timeoutMs === right.timeoutMs
+      && left.optimizerPrompt === right.optimizerPrompt
+      && left.optimizerFewShot === right.optimizerFewShot
+      && JSON.stringify(left.fewShots) === JSON.stringify(right.fewShots)
+      && ((left.route === null && right.route === null)
+        || (left.route !== null && right.route !== null
+          && left.route.provider === right.route.provider
+          && left.route.model === right.route.model))
+  }
+
+  function routeKey(route) {
+    return route === null ? '' : JSON.stringify([route.provider, route.model])
+  }
+
+  function modelOptions(groups) {
+    const rows = []
+    for (const group of Array.isArray(groups) ? groups : []) {
+      if (!group || typeof group.id !== 'string' || !Array.isArray(group.models)) continue
+      for (const model of group.models) {
+        if (!model || typeof model.id !== 'string') continue
+        rows.push({
+          provider: group.id,
+          model: model.id,
+          label: typeof model.name === 'string' && model.name !== '' ? model.name : model.id,
+          providerLabel: typeof group.name === 'string' && group.name !== '' ? group.name : group.id,
+        })
+      }
+    }
+    return rows
+  }
+
+  function PromptOptimizerSettingsCard(props) {
+    const zh = isChinese()
+    const copy = zh ? {
+      title: '提示词优化',
+      description: '帮你写下一条开发提示词，或把输入框里的草稿改得更清楚。',
+      expand: '展开设置', collapse: '收起设置', unsaved: '未保存',
+      advanced: '高级设置（通常不用改）',
+      sectionModel: '使用哪个模型',
+      sectionSpeed: '生成速度',
+      modelTitle: '模型选择方式',
+      defaultRoute: '和当前会话一致（推荐）', defaultRouteHint: '你发送消息时用什么模型，提示词优化也用什么模型。',
+      customModel: '始终使用指定模型', customModelHint: '每次生成提示词都固定使用下面选择的模型。',
+      model: '选择模型',
+      reasoningTitle: '生成方式', reasoningHint: '默认最快：不进行思考，直接生成答案。需要更深入分析时再提高。',
+      reasoningInherit: '和当前会话一样', reasoningOff: '最快（不思考）', reasoningLow: '认真一点（低）', reasoningHigh: '更认真（高）', reasoningMax: '最认真（最高）',
+      noModels: '当前没有可用的模型目录。',
+      modelsHint: '选择「自定义模型」后加载 dsh 模型列表。',
+      modelsSavedHint: '已固定模型；如需使用 dsh 模型列表，请点击加载。',
+      refreshModels: '加载模型列表',
+      retryModels: '重试',
+      loadingModels: '正在读取 dsh 可用提供商/模型…', modelError: '模型列表读取失败，可稍后重试。',
+      projectContext: '参考当前项目', projectContextHint: '让提示词优化了解项目结构和改动，生成更贴近当前工作的提示词。',
+      projectDepth: '参考范围', maxFiles: '最多参考文件数', maxContext: '项目内容上限',
+      maxOutput: '最长输出', timeout: '等待时间', seconds: '秒', tokens: 'Tokens', files: '个文件', kb: 'KB',
+      fewShots: 'Few-shot 示例', fewShotsHint: '示例只用于学习改写方式，不要照搬示例中的事实；最多保存 16 条。',
+      optimizerTemplate: '优化提示词模板',
+      optimizerTemplateHint: '展开后可分别编辑「提示词」「Few-shot」两段模板，并维护自己的 Few-shot 示例。',
+      optimizerPromptPart: '提示词（identity / requirements / guidelines / output format）',
+      optimizerFewShotPart: 'Few-shot（<example> 示例段）',
+      optimizerOfficial: '官方默认',
+      optimizerCustom: '已自定义',
+      restoreDefault: '恢复默认',
+      fewShotAdd: '添加示例', fewShotDelete: '删除', fewShotRewrite: '提示词改写', fewShotTask: '任务提示',
+      fewShotEnabled: '启用', fewShotInput: '原始提示词', fewShotHint: '宽泛任务提示', fewShotOutput: '优化后的任务指令',
+      configured: '当前配置', readOnly: '当前设置存储为只读，不能在这里修改。',
+      settingsUnavailable: '插件设置读取失败，当前显示默认值；保存不可用。',
+      saveFailed: '保存没有生效，请检查 Host 设置服务。',
+      discard: '放弃', save: '保存', saving: '保存中…',
+    } : {
+      title: 'Prompt Optimizer',
+      description: 'Write the next development prompt, or make the current draft clearer.',
+      expand: 'Expand settings', collapse: 'Collapse settings', unsaved: 'Unsaved',
+      advanced: 'Advanced settings (usually unchanged)',
+      sectionModel: 'Which model to use',
+      sectionSpeed: 'Response speed',
+      modelTitle: 'Model choice',
+      defaultRoute: 'Same as current Session (recommended)', defaultRouteHint: 'Use the same model that will receive your message.',
+      customModel: 'Always use a specific model', customModelHint: 'Generate every suggestion with the model selected below.',
+      model: 'Select model',
+      reasoningTitle: 'Generation mode', reasoningHint: 'Fastest is the default: answer directly without reasoning. Increase it only when deeper analysis is useful.',
+      reasoningInherit: 'Same as current Session', reasoningOff: 'Fastest (no reasoning)', reasoningLow: 'Slightly deeper', reasoningHigh: 'Deeper', reasoningMax: 'Deepest',
+      noModels: 'No model directory is available right now.',
+      modelsHint: 'Choose “Custom model” to load the dsh model list.',
+      modelsSavedHint: 'A model is pinned. Load the dsh model list to choose another one.',
+      refreshModels: 'Load model list',
+      retryModels: 'Retry',
+      loadingModels: 'Loading dsh providers/models…', modelError: 'Could not load models. Try again later.',
+      projectContext: 'Use current project as context', projectContextHint: 'Understand the project structure and recent changes to produce a more relevant prompt.',
+      projectDepth: 'Context range', maxFiles: 'Max referenced files', maxContext: 'Project context limit',
+      maxOutput: 'Max output length', timeout: 'Wait time', seconds: 'sec', tokens: 'Tokens', files: 'files', kb: 'KB',
+      fewShots: 'Few-shot examples', fewShotsHint: 'Examples teach rewrite style; never copy example-specific facts. Up to 16 examples.',
+      optimizerTemplate: 'Optimizer prompt template',
+      optimizerTemplateHint: 'Expand to edit the Prompt and Few-shot template halves separately, and to manage your own few-shot examples.',
+      optimizerPromptPart: 'Prompt (identity / requirements / guidelines / output format)',
+      optimizerFewShotPart: 'Few-shot (the <example> section)',
+      optimizerOfficial: 'Official default',
+      optimizerCustom: 'Customized',
+      restoreDefault: 'Restore default',
+      fewShotAdd: 'Add example', fewShotDelete: 'Delete', fewShotRewrite: 'Prompt pair', fewShotTask: 'Task hint',
+      fewShotEnabled: 'Enabled', fewShotInput: 'Original prompt', fewShotHint: 'Broad task hint', fewShotOutput: 'Optimized task instruction',
+      configured: 'Configured', readOnly: 'The current settings store is read-only.',
+      settingsUnavailable: 'Plugin settings could not be loaded. Defaults are shown and saving is unavailable.',
+      saveFailed: 'The settings were not saved. Check the Host settings service.',
+      discard: 'Discard', save: 'Save', saving: 'Saving…',
+    }
+    const snapshot = React.useSyncExternalStore(
+      props.poSettingsStore.subscribe,
+      props.poSettingsStore.getSnapshot,
+    )
+    const resolved = normalizeUserSettings(snapshot.value)
+    const [draft, setDraft] = React.useState(resolved)
+    const [baseline, setBaseline] = React.useState(resolved)
+    const baselineRef = React.useRef(resolved)
+    const [saving, setSaving] = React.useState(false)
+    const [failed, setFailed] = React.useState(false)
+    const [modelRequested, setModelRequested] = React.useState(false)
+    const [customSelectionPending, setCustomSelectionPending] = React.useState(false)
+    const modelLoadingRef = React.useRef(false)
+    const [models, setModels] = React.useState({
+      groups: [], status: 'idle', error: null,
+    })
+
+    React.useEffect(() => {
+      const previous = baselineRef.current
+      baselineRef.current = resolved
+      setBaseline(resolved)
+      setDraft((current) => sameUserSettings(current, previous) ? resolved : current)
+    }, [snapshot.revision])
+
+    const loadModels = React.useCallback(async () => {
+      if (modelLoadingRef.current) return
+      modelLoadingRef.current = true
+      setModels((current) => ({ ...current, groups: current.groups, status: 'loading', error: null }))
+      try {
+        const result = await rpcWithTimeout('model-catalog', {})
+        const catalog = result && result.ok === true && result.catalog
+          ? result.catalog
+          : (result && result.groups ? result : null)
+        if (!catalog) throw new Error('catalog-unavailable')
+        setModels({
+          groups: Array.isArray(catalog.groups) ? catalog.groups : [],
+          status: 'ready',
+          error: null,
+        })
+      } catch {
+        setModels({ groups: [], status: 'error', error: 'unavailable' })
+      } finally {
+        modelLoadingRef.current = false
+      }
+    }, [])
+
+    React.useEffect(() => {
+      if (!modelRequested || !customSelectionPending || draft.route !== null) return
+      const available = modelOptions(models.groups)
+      if (available.length === 0) return
+      setDraft((current) => ({
+        ...current,
+        route: { provider: available[0].provider, model: available[0].model },
+      }))
+      setCustomSelectionPending(false)
+    }, [modelRequested, customSelectionPending, models.groups, draft.route])
+
+    const h = React.createElement
+    const dirty = !sameUserSettings(draft, baseline)
+    const writable = snapshot.writable === true
+    const options = modelOptions(models.groups)
+    const configuredKey = routeKey(draft.route)
+    if (draft.route !== null && !options.some((option) => routeKey(option) === configuredKey)) {
+      options.unshift({
+        provider: draft.route.provider,
+        model: draft.route.model,
+        label: draft.route.model,
+        providerLabel: `${draft.route.provider} · ${copy.configured}`,
+      })
+    }
+    const fixedFallback = draft.route || options[0] || null
+
+    const save = async () => {
+      if (!dirty || !writable || saving) return
+      setSaving(true)
+      setFailed(false)
+      // Store '' when a half still equals the default text, so "restore
+      // default" stays representable and the assembled prompt is byte-exact.
+      const defaults = snapshot.defaults || {}
+      const payload = {
+        ...draft,
+        optimizerPrompt: draft.optimizerPrompt === defaults.optimizerPrompt
+          ? ''
+          : draft.optimizerPrompt,
+        optimizerFewShot: draft.optimizerFewShot === defaults.optimizerFewShot
+          ? ''
+          : draft.optimizerFewShot,
+      }
+      await props.poSettingsScope.replace(payload)
+      const actual = normalizeUserSettings(props.poSettingsScope.getSnapshot().value)
+      const succeeded = sameUserSettings(actual, payload)
+      baselineRef.current = actual
+      setBaseline(actual)
+      if (succeeded) setDraft(actual)
+      setFailed(!succeeded)
+      setSaving(false)
+    }
+
+    const integerInput = (event, fallback = 0) => {
+      const next = Number(event.target.value)
+      return Number.isSafeInteger(next) ? next : fallback
+    }
+
+    const updateFewShot = (index, patch) => setDraft((current) => ({
+      ...current,
+      fewShots: current.fewShots.map((shot, shotIndex) => shotIndex === index
+        ? { ...shot, ...patch }
+        : shot),
+    }))
+
+    const addFewShot = () => {
+      if (draft.fewShots.length >= 16) return
+      setDraft({
+        ...draft,
+        fewShots: [...draft.fewShots, {
+          id: `few-shot-${Date.now()}`,
+          type: 'rewrite',
+          enabled: true,
+          input: '',
+          output: '',
+        }],
+      })
+    }
+
+    const modelStatus = !modelRequested
+      ? draft.route === null ? copy.modelsHint : copy.modelsSavedHint
+      : models.status === 'loading'
+      ? copy.loadingModels
+      : models.status === 'error'
+      ? copy.modelError
+      : options.length === 0
+      ? copy.noModels
+      : null
+    const settingsUnavailable = snapshot.status === 'unavailable'
+
+    // --- Built-in optimizer template -------------------------------------
+    // Split in two independently editable halves. Defaults come from the Host
+    // so "restore default" always restores the exact built-in bytes; keeping
+    // both halves at their defaults reassembles the original prompt verbatim.
+    const optimizerDefaults = snapshot.defaults || {}
+    const defaultPromptPart = optimizerDefaults.optimizerPrompt || ''
+    const defaultFewShotPart = optimizerDefaults.optimizerFewShot || ''
+    const optimizerPromptText = draft.optimizerPrompt || defaultPromptPart
+    const optimizerFewShotText = draft.optimizerFewShot || defaultFewShotPart
+    const optimizerCustomized = optimizerPromptText !== defaultPromptPart
+      || optimizerFewShotText !== defaultFewShotPart
+
+    const fewShotEditor = h('section', { className: 'dsh-po-settings-fewshots' },
+      h('div', { className: 'dsh-po-settings-fewshots-header' },
+        h('span', { className: 'dsh-po-settings-fewshots-title' }, copy.fewShots),
+        h('button', {
+          type: 'button', className: 'dsh-po-settings-button',
+          disabled: !writable || draft.fewShots.length >= 16,
+          onClick: addFewShot,
+        }, copy.fewShotAdd)),
+      h('p', { className: 'dsh-po-settings-hint' }, copy.fewShotsHint),
+      draft.fewShots.map((shot, index) => {
+        const field = shot.type === 'rewrite' ? 'input' : 'hint'
+        return h('fieldset', {
+          className: 'dsh-po-settings-fewshot', key: shot.id,
+          disabled: !writable,
+        },
+        h('legend', null, shot.type === 'rewrite' ? copy.fewShotRewrite : copy.fewShotTask),
+        h('div', { className: 'dsh-po-settings-fewshot-controls' },
+          h('select', {
+            className: 'dsh-po-settings-select', value: shot.type,
+            'aria-label': copy.fewShots,
+            onChange: (event) => {
+              const nextType = event.target.value
+              const text = shot[field]
+              updateFewShot(index, {
+                type: nextType,
+                ...(nextType === 'rewrite'
+                  ? { input: text, hint: undefined }
+                  : { hint: text, input: undefined }),
+              })
+            },
+          }, [
+            h('option', { key: 'rewrite', value: 'rewrite' }, copy.fewShotRewrite),
+            h('option', { key: 'task', value: 'task' }, copy.fewShotTask),
+          ]),
+          h('label', { className: 'dsh-po-switch' },
+            h('input', {
+              type: 'checkbox', checked: shot.enabled,
+              'aria-label': copy.fewShotEnabled,
+              onChange: (event) => updateFewShot(index, { enabled: event.target.checked }),
+            }), h('span')),
+          h('button', {
+            type: 'button', className: 'dsh-po-settings-button',
+            'aria-label': copy.fewShotDelete,
+            onClick: () => setDraft({
+              ...draft,
+              fewShots: draft.fewShots.filter((_, shotIndex) => shotIndex !== index),
+            }),
+          }, copy.fewShotDelete)),
+        h('label', { className: 'dsh-po-settings-fewshot-field' },
+          h('span', { className: 'dsh-po-settings-label' }, shot.type === 'rewrite' ? copy.fewShotInput : copy.fewShotHint),
+          h('textarea', {
+            className: 'dsh-po-settings-textarea', rows: 3, maxLength: 8192,
+            value: shot[field], disabled: !writable,
+            onChange: (event) => updateFewShot(index, { [field]: event.target.value }),
+          })),
+        h('label', { className: 'dsh-po-settings-fewshot-field' },
+          h('span', { className: 'dsh-po-settings-label' }, copy.fewShotOutput),
+          h('textarea', {
+            className: 'dsh-po-settings-textarea', rows: 4, maxLength: 16384,
+            value: shot.output, disabled: !writable,
+            onChange: (event) => updateFewShot(index, { output: event.target.value }),
+          })))
+      }))
+
+    const optimizerTemplateEditor = h('details', { className: 'dsh-po-settings-advanced' },
+      h('summary', { className: 'dsh-po-settings-advanced-toggle' },
+        h('span', { className: 'dsh-po-settings-fewshots-title' }, copy.optimizerTemplate),
+        h('span', {
+          className: 'dsh-po-settings-badge',
+          'data-custom': optimizerCustomized ? 'true' : 'false',
+        }, optimizerCustomized ? copy.optimizerCustom : copy.optimizerOfficial)),
+      h('div', { className: 'dsh-po-settings-advanced-body' },
+        h('p', { className: 'dsh-po-settings-hint' }, copy.optimizerTemplateHint),
+        h('div', { className: 'dsh-po-settings-fewshot-field' },
+          h('div', { className: 'dsh-po-settings-fewshots-header' },
+            h('span', { className: 'dsh-po-settings-label' }, copy.optimizerPromptPart),
+            h('button', {
+              type: 'button', className: 'dsh-po-settings-button',
+              disabled: !writable || optimizerPromptText === defaultPromptPart,
+              onClick: () => setDraft({ ...draft, optimizerPrompt: '' }),
+            }, copy.restoreDefault)),
+          h('textarea', {
+            className: 'dsh-po-settings-textarea dsh-po-settings-template',
+            rows: 10, spellCheck: false, value: optimizerPromptText, disabled: !writable,
+            onChange: (event) => setDraft({ ...draft, optimizerPrompt: event.target.value }),
+          })),
+        h('div', { className: 'dsh-po-settings-fewshot-field' },
+          h('div', { className: 'dsh-po-settings-fewshots-header' },
+            h('span', { className: 'dsh-po-settings-label' }, copy.optimizerFewShotPart),
+            h('button', {
+              type: 'button', className: 'dsh-po-settings-button',
+              disabled: !writable || optimizerFewShotText === defaultFewShotPart,
+              onClick: () => setDraft({ ...draft, optimizerFewShot: '' }),
+            }, copy.restoreDefault)),
+          h('textarea', {
+            className: 'dsh-po-settings-textarea dsh-po-settings-template',
+            rows: 10, spellCheck: false, value: optimizerFewShotText, disabled: !writable,
+            onChange: (event) => setDraft({ ...draft, optimizerFewShot: event.target.value }),
+          })),
+        fewShotEditor))
+
+    return h('div', { className: 'dsh-po-settings-page' },
+      h('header', { className: 'dsh-po-settings-panel-header' },
+        h('div', { className: 'dsh-po-settings-head-text' },
+          h('h2', { className: 'dsh-po-settings-name' }, copy.title),
+          h('p', { className: 'dsh-po-settings-description' }, copy.description)),
+        dirty ? h('span', { className: 'dsh-po-settings-pending' }, copy.unsaved) : null),
+      h('div', { className: 'dsh-po-settings-panel-body' },
+      settingsUnavailable ? h('p', {
+        className: 'dsh-po-settings-status dsh-po-settings-warning',
+        role: 'status',
+      }, copy.settingsUnavailable) : null,
+      !writable ? h('p', { className: 'dsh-po-settings-status', role: 'status' }, copy.readOnly) : null,
+      h('div', { className: 'dsh-po-settings-section-title' }, copy.sectionModel),
+      h('div', { className: 'dsh-po-settings-row' },
+        h('div', { className: 'dsh-po-settings-copy' },
+          h('span', { className: 'dsh-po-settings-label' }, copy.modelTitle),
+          h('span', { className: 'dsh-po-settings-hint' }, draft.route === null
+            ? copy.defaultRouteHint
+            : copy.customModelHint)),
+        h('div', { className: 'dsh-po-settings-model-control' },
+          h('div', { className: 'dsh-po-settings-choices' },
+            h('label', {
+              className: 'dsh-po-settings-choice', 'data-selected': String(draft.route === null),
+            }, h('input', {
+              type: 'radio', name: 'dsh-po-model-route', checked: draft.route === null,
+              disabled: !writable,
+              onChange: () => {
+                setCustomSelectionPending(false)
+                setDraft({ ...draft, route: null })
+              },
+            }), h('strong', null, copy.defaultRoute), h('small', null, copy.defaultRouteHint)),
+            h('label', {
+              className: 'dsh-po-settings-choice', 'data-selected': String(draft.route !== null),
+            }, h('input', {
+              type: 'radio', name: 'dsh-po-model-route', checked: draft.route !== null,
+              disabled: !writable,
+              onChange: () => {
+                setModelRequested(true)
+                setCustomSelectionPending(true)
+                if (fixedFallback) setDraft({
+                  ...draft,
+                  route: { provider: fixedFallback.provider, model: fixedFallback.model },
+                })
+                void loadModels()
+              },
+            }), h('strong', null, copy.customModel), h('small', null, copy.customModelHint))),
+          draft.route !== null ? h('select', {
+            className: 'dsh-po-settings-select', value: routeKey(draft.route), disabled: !writable,
+            'aria-label': copy.model,
+            onChange: (event) => {
+              const selected = options.find((option) => routeKey(option) === event.target.value)
+              if (selected) {
+                setCustomSelectionPending(false)
+                setDraft({
+                  ...draft, route: { provider: selected.provider, model: selected.model },
+                })
+              }
+            },
+          }, options.map((option) => h('option', {
+            key: routeKey(option), value: routeKey(option),
+          }, `${option.providerLabel} · ${option.label}`))) : null,
+          !modelRequested && draft.route !== null ? h('button', {
+            type: 'button',
+            className: 'dsh-po-settings-button dsh-po-settings-model-refresh',
+            disabled: !writable,
+            onClick: () => {
+              setModelRequested(true)
+              setCustomSelectionPending(false)
+              void loadModels()
+            },
+          }, copy.refreshModels) : null,
+          modelRequested && models.status === 'error' ? h('button', {
+            type: 'button',
+            className: 'dsh-po-settings-button dsh-po-settings-model-refresh',
+            disabled: !writable,
+            onClick: () => {
+              setCustomSelectionPending(true)
+              void loadModels()
+            },
+          }, copy.retryModels) : null,
+          modelStatus ? h('p', {
+            className: 'dsh-po-settings-status',
+            'data-error': String(models.status === 'error'), role: 'status',
+          }, modelStatus) : null)),
+      h('div', { className: 'dsh-po-settings-section-title' }, copy.sectionSpeed),
+      h('div', { className: 'dsh-po-settings-row' },
+        h('span', { className: 'dsh-po-settings-copy' },
+          h('span', { className: 'dsh-po-settings-label' }, copy.reasoningTitle),
+          h('span', { className: 'dsh-po-settings-hint' }, copy.reasoningHint)),
+        h('select', {
+          className: 'dsh-po-settings-select', value: draft.reasoningEffort,
+          disabled: !writable, 'aria-label': copy.reasoningTitle,
+          onChange: (event) => setDraft({ ...draft, reasoningEffort: event.target.value }),
+        }, [
+          ['off', copy.reasoningOff],
+          ['inherit', copy.reasoningInherit],
+          ['low', copy.reasoningLow],
+          ['high', copy.reasoningHigh],
+          ['max', copy.reasoningMax],
+        ].map(([value, label]) => h('option', { key: value, value }, label)))),
+      h('details', { className: 'dsh-po-settings-advanced' },
+        h('summary', { className: 'dsh-po-settings-advanced-toggle' }, copy.advanced),
+        h('div', { className: 'dsh-po-settings-advanced-body' },
+          // Project-context controls are archived: hidden while the feature is off.
+          ...(config.features.projectContext !== false ? [
+          h('div', { className: 'dsh-po-settings-row' },
+            h('div', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.projectContext),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.projectContextHint)),
+            h('label', { className: 'dsh-po-switch' },
+              h('input', {
+                type: 'checkbox', checked: draft.projectContextEnabled,
+                disabled: !writable,
+                onChange: (event) => setDraft({
+                  ...draft,
+                  projectContextEnabled: event.target.checked,
+                }),
+              }), h('span'))),
+          h('div', { className: 'dsh-po-settings-row' },
+            h('span', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.projectDepth),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.projectContextHint)),
+            h('select', {
+              className: 'dsh-po-settings-select', value: String(draft.projectContextDepth),
+              disabled: !writable, 'aria-label': copy.projectDepth,
+              onChange: (event) => setDraft({
+                ...draft,
+                projectContextDepth: Number(event.target.value),
+              }),
+            }, [0, 1, 2, 3, 4, 5].map((depth) => h('option', {
+              key: depth, value: String(depth),
+            }, `${depth}`)))),
+          h('div', { className: 'dsh-po-settings-row' },
+            h('span', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.maxFiles),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.files)),
+            h('input', {
+              type: 'number', name: 'maxProjectTreeFiles', min: 1, max: 500,
+              className: 'dsh-po-settings-input dsh-po-settings-number',
+              value: String(draft.maxProjectTreeFiles), disabled: !writable,
+              onChange: (event) => setDraft({
+                ...draft,
+                maxProjectTreeFiles: integerInput(event, DEFAULT_USER_SETTINGS.maxProjectTreeFiles),
+              }),
+            })),
+          h('div', { className: 'dsh-po-settings-row' },
+            h('span', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.maxContext),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.kb)),
+            h('input', {
+              type: 'number', name: 'maxProjectContextBytes', min: 1, max: 128,
+              className: 'dsh-po-settings-input dsh-po-settings-number',
+              value: String(Math.round(draft.maxProjectContextBytes / 1024)),
+              disabled: !writable,
+              onChange: (event) => setDraft({
+                ...draft,
+                maxProjectContextBytes: integerInput(event, DEFAULT_USER_SETTINGS.maxProjectContextBytes) * 1024,
+              }),
+            })),
+          ] : []),
+          h('div', { className: 'dsh-po-settings-row' },
+            h('span', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.maxOutput),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.tokens)),
+            h('input', {
+              type: 'number', name: 'maxOutputTokens', min: 1, max: 16384,
+              className: 'dsh-po-settings-input dsh-po-settings-number',
+              value: String(draft.maxOutputTokens), disabled: !writable,
+              onChange: (event) => setDraft({
+                ...draft,
+                maxOutputTokens: integerInput(event, DEFAULT_USER_SETTINGS.maxOutputTokens),
+              }),
+            })),
+          h('div', { className: 'dsh-po-settings-row' },
+            h('span', { className: 'dsh-po-settings-copy' },
+              h('span', { className: 'dsh-po-settings-label' }, copy.timeout),
+              h('span', { className: 'dsh-po-settings-hint' }, copy.seconds)),
+            h('input', {
+              type: 'number', name: 'timeoutMs', min: 1, max: 300,
+              className: 'dsh-po-settings-input dsh-po-settings-number',
+              value: String(Math.round(draft.timeoutMs / 1000)),
+              disabled: !writable,
+              onChange: (event) => setDraft({
+                ...draft,
+                timeoutMs: integerInput(event, DEFAULT_USER_SETTINGS.timeoutMs) * 1000,
+              }),
+            })))),
+          optimizerTemplateEditor,
+      h('div', { className: 'dsh-po-settings-footer' },
+        failed ? h('p', {
+          className: 'dsh-po-settings-status', 'data-error': 'true', role: 'status',
+        }, copy.saveFailed) : null,
+        h('button', {
+          type: 'button', className: 'dsh-po-settings-button', disabled: !dirty || saving,
+          onClick: () => {
+            setDraft(baseline)
+            setFailed(false)
+          },
+        }, copy.discard),
+        h('button', {
+          type: 'button', className: 'dsh-po-settings-button dsh-po-settings-save',
+          disabled: !dirty || !writable || saving, onClick: () => { void save() },
+        }, saving ? copy.saving : copy.save))
+    ))
+  }
+
+  return {
+    inject: ['slots'],
+    apply(ctx) {
+      insertStyles()
+      const slots = ctx.get('slots')
+      if (!slots) throw new Error('dsh-prompt-optimizer: slots service is unavailable')
+      const settingsScope = createSettingsController()
+      const settingsStore = {
+        getSnapshot: () => settingsScope.getSnapshot(),
+        subscribe: (listener) => settingsScope.subscribe(listener),
+      }
+      const applySettingsSnapshot = () => {
+        const snapshot = settingsScope.getSnapshot()
+        if (snapshot.status !== 'ready') return
+        if (snapshot.features) config.features = { ...config.features, ...snapshot.features }
+        const value = normalizeUserSettings(snapshot.value)
+        applyConfiguration({
+          ok: true,
+          automatic: value.automatic,
+          projectContextEnabled: value.projectContextEnabled,
+        })
+      }
+      applySettingsSnapshot()
+      ctx.effect(
+        () => settingsScope.subscribe(applySettingsSnapshot),
+        'dsh-prompt-optimizer: settings updates',
+      )
+      void settingsScope.load()
+      void ensureConfiguration(true)
+      slots.inject('conversation.input.right', () => slots.register({
+        name: 'conversation.input.right',
+        id: 'prompt-optimizer',
+        order: 90,
+        label: () => isChinese() ? '提示词优化' : 'Prompt Optimizer',
+      }, PromptOptimizerButton))
+      slots.inject('conversation.input.dock', () => slots.register({
+        name: 'conversation.input.dock',
+        id: 'prompt-optimizer-preview',
+        order: 89,
+        label: () => isChinese() ? '提示词优化预览' : 'Prompt Optimizer preview',
+      }, PromptOptimizerPreview))
+      slots.inject('settings.section', () => slots.register({
+        name: 'settings.section',
+        id: 'prompt-optimizer',
+        order: 100,
+        label: () => isChinese() ? '提示词优化' : 'Prompt Optimizer',
+        icon: React.createElement(SparklesIcon),
+        iconName: 'prompt',
+        Icon: SparklesIcon,
+        renderIcon: () => React.createElement(SparklesIcon),
+        inject: () => ({
+          poSettingsScope: settingsScope,
+          poSettingsStore: settingsStore,
+        }),
+      }, PromptOptimizerSettingsCard))
+    },
+    _testing: {
+      activeCandidate,
+      applyManualHistory,
+      applyConfiguration,
+      config,
+      createSettingsController,
+      hasGenerationContext,
+      modelOptions,
+      normalizeUserSettings,
+      observe,
+      latestTurnEnd,
+      readOutcomes,
+      recordOutcome,
+      storeFor,
+      stopManual,
+      tooltipText,
+      trigger,
+      useFallback,
+    },
+  }
+}

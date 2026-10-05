@@ -1,0 +1,39 @@
+# Dependencies and generated package artifacts
+node_modules/
+.npm-cache/
+coverage/
+*.tgz
+
+# Local verification captures (may contain private session/UI content)
+.verify/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+tmp/
+temp/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local prompt research captures and service-bridge tooling
+/docs/trae-prompt-templates/
+/docs/trae-optimize-user-input-template.txt
+/docs/trae-prompt-template-export.md
+/docs/prompt-candidates.jsonl
+/docs/prompt-optimization-method.md
+/docs/few-shot-library.json
+/docs/fixtures/trae-batch-*
+/scripts/trae-*.cjs
+/scripts/frida-*.py
+/scripts/probe-llm-utils-schema.cjs
+/scripts/scan-memory-*.cjs
+/scripts/run-trae-batch.cjs
