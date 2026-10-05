@@ -2,9 +2,23 @@
 
 Notable changes to this project are documented here.
 
+## [1.0.1] - 2026-10-05
+
+### Fixed
+
+- **Web boot crash.** The client bundle hardcoded `id: "dsh-prompt-optimizer"`
+  while the package is `@panando/dsh-prompt-optimizer`. DSH keys its client-module
+  manifest by the package specifier, so a scoped package declaring a different id
+  failed every DSH boot with `client-modules: duplicate factory registration for
+  "dsh-prompt-optimizer"`. The bundle id is now derived from `package.json#name`,
+  the build fails if the generated id ever diverges from it, and a test asserts
+  the invariant. (v1.0.0 is unusable and should not be installed.)
+
 ## [1.0.0] - 2026-10-05
 
 First release of `@panando/dsh-prompt-optimizer`.
+
+> **Do not install 1.0.0** — it crashes DSH web boot; use 1.0.1 or later.
 
 ### Changed
 
